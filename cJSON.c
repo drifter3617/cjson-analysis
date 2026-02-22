@@ -999,6 +999,19 @@ static parse_buffer *skip_utf8_bom(parse_buffer * const buffer)
     return buffer;
 }
 
+/**
+ * 解析JSON字符串（高级版）
+ * 
+ * @param value 要解析的JSON字符串（必须以null结尾）
+ * @param return_parse_end 输出参数，返回解析结束的位置（用于错误定位）
+ * @param require_null_terminated 是否强制检查JSON后没有多余字符
+ * @return 解析成功的cJSON对象，失败返回NULL
+ * 
+ * 说明：
+ * - 相比cJSON_Parse()，这个函数提供了更多控制选项
+ * - require_null_terminated = true 表示严格模式：JSON后只能有空白字符
+ * - 可通过return_parse_end获取解析中断位置，便于调试
+ */
 CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return_parse_end, cJSON_bool require_null_terminated)
 {
     size_t buffer_length;
@@ -1008,8 +1021,10 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithOpts(const char *value, const char **return
         return NULL;
     }
 
+    /* 计算缓冲区长度（包含结尾的'\0'），传递给更底层的解析函数 */
     buffer_length = strlen(value) + sizeof("");
 
+    /* 委托给功能更完整的cJSON_ParseWithLengthOpts处理 */
     return cJSON_ParseWithLengthOpts(value, buffer_length, return_parse_end, require_null_terminated);
 }
 
