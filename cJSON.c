@@ -959,23 +959,44 @@ static cJSON_bool print_array(const cJSON * const item, printbuffer * const outp
 static cJSON_bool parse_object(cJSON * const item, parse_buffer * const input_buffer);
 static cJSON_bool print_object(const cJSON * const item, printbuffer * const output_buffer);
 
+/**
+ * 跳过JSON字符串中的空白字符
+ * 
+ * 设计缘由：
+ * 1. JSON标准(RFC 8259)允许在语法元素间存在空白(空格/制表/换行/回车)
+ * 2. 解析器需要跳过这些无意义的空白，定位到真正的JSON内容开始位置
+ * 3. 空白字符判断：ASCII码 <= 32 包含了所有标准空白字符
+ * 
+ * 实现原理：
+ * 1. 防御性检查：确保缓冲区有效，避免空指针崩溃
+ * 2. 边界处理：如果已到末尾，无需跳过直接返回
+ * 3. 循环跳过：连续读取字符直到遇到非空白
+ * 4. 越界保护：跳过所有空白后如果刚好到末尾，回退一位防止后续访问越界
+ * 
+ * @param buffer 解析缓冲区
+ * @return 跳过空白后的缓冲区，失败返回NULL
+ */
 static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
 {
+    /* 防御性编程：确保缓冲区和内容有效 */
     if ((buffer == NULL) || (buffer->content == NULL))
     {
         return NULL;
     }
 
+    /* 边界处理：已无字符可访问，直接返回 */
     if (cannot_access_at_index(buffer, 0))
     {
         return buffer;
     }
 
+    /* 核心逻辑：跳过所有空白字符（ASCII码 <= 32） */
     while (can_access_at_index(buffer, 0) && (buffer_at_offset(buffer)[0] <= 32))
     {
        buffer->offset++;
     }
 
+    /* 越界保护：如果offset指向末尾，回退一位避免后续访问越界 */
     if (buffer->offset == buffer->length)
     {
         buffer->offset--;
@@ -984,18 +1005,48 @@ static parse_buffer *buffer_skip_whitespace(parse_buffer * const buffer)
     return buffer;
 }
 
+/**
+ * @brief 跳过UTF-8 BOM (Byte Order Mark) 头部
+ * 
+ * 该函数用于检测并跳过UTF-8文件的BOM头（EF BB BF）。
+ * BOM是Unicode标准中用于标识文本编码的标记，UTF-8的BOM是可选的，
+ * 但在某些情况下（如Windows记事本保存的UTF-8文件）会包含BOM头。
+ * 
+ * @param buffer 指向parse_buffer结构体的指针，包含要处理的数据缓冲区
+ * @return parse_buffer* 成功时返回原buffer指针（可能已更新offset），失败时返回NULL
+ */
 static parse_buffer *skip_utf8_bom(parse_buffer * const buffer)
 {
+    /* 参数有效性检查：
+     * 1. buffer指针不能为NULL
+     * 2. buffer的内容不能为NULL
+     * 3. 当前偏移量必须为0（只能在开始位置跳过BOM）
+     * 如果任何条件不满足，返回NULL表示无法处理
+     */
     if ((buffer == NULL) || (buffer->content == NULL) || (buffer->offset != 0))
     {
         return NULL;
     }
 
+    /* 检查BOM头是否存在：
+     * 1. can_access_at_index(buffer, 4)：确保缓冲区至少有4个字节可访问
+     *    为什么要检查4个字节？因为需要读取前3个字节比较，同时确保不越界
+     * 2. strncmp比较前3个字节是否为UTF-8 BOM：\xEF\xBB\xBF
+     *    UTF-8 BOM的十六进制表示：EF BB BF
+     */
     if (can_access_at_index(buffer, 4) && (strncmp((const char*)buffer_at_offset(buffer), "\xEF\xBB\xBF", 3) == 0))
     {
+        /* 如果检测到BOM头，将偏移量向后移动3个字节，
+         * 这样后续的数据处理就会跳过BOM，直接处理真正的JSON内容
+         */
         buffer->offset += 3;
     }
 
+    /* 返回更新后的buffer指针：
+     * - 如果检测到BOM，offset已经增加了3
+     * - 如果没有BOM，offset保持为0
+     * - 如果参数无效，返回NULL
+     */
     return buffer;
 }
 
