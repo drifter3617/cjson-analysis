@@ -717,6 +717,18 @@ fail:
     return 0;
 }
 
+/**
+ * 解析JSON字符串并将其转换为C字符串
+ * 
+ * 函数处理流程：
+ * 1. 验证字符串起始字符必须是双引号
+ * 2. 第一遍扫描：找到结束双引号，同时统计转义字符数量以计算解码后长度
+ * 3. 第二遍扫描：实际进行转义序列的解码
+ * 
+ * @param item 待填充的cJSON对象，解析成功后会设置type为cJSON_String并填充valuestring
+ * @param input_buffer 输入缓冲区，包含当前解析位置和剩余数据
+ * @return 解析成功返回true，失败返回false
+ */
 static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_buffer)
 {
     const unsigned char *input_pointer = buffer_at_offset(input_buffer) + 1;
@@ -724,104 +736,137 @@ static cJSON_bool parse_string(cJSON * const item, parse_buffer * const input_bu
     unsigned char *output_pointer = NULL;
     unsigned char *output = NULL;
 
+    /* 检查字符串必须以双引号开头 */
     if (buffer_at_offset(input_buffer)[0] != '\"')
     {
         goto fail;
     }
 
+    /**
+     * 第一阶段：扫描整个字符串，确定解码后的长度
+     * 跳过转义字符计算实际字符数，为内存分配做准备
+     */
     {
         size_t allocation_length = 0;
-        size_t skipped_bytes = 0;
+        size_t skipped_bytes = 0;  /* 转义字符占用的额外字节数 */
+        
+        /* 寻找结束双引号，同时处理转义序列 */
         while (((size_t)(input_end - input_buffer->content) < input_buffer->length) && (*input_end != '\"'))
         {
             if (input_end[0] == '\\')
             {
+                /* 检查反斜杠后是否还有字符 */
                 if ((size_t)(input_end + 1 - input_buffer->content) >= input_buffer->length)
                 {
-                    goto fail;
+                    goto fail;  /* 字符串截断，非法JSON */
                 }
-                skipped_bytes++;
-                input_end++;
+                skipped_bytes++;  /* 反斜杠本身不计入最终字符串长度 */
+                input_end++;      /* 跳过反斜杠，下一轮循环处理转义字符 */
             }
             input_end++;
         }
+        
+        /* 验证是否找到结束双引号 */
         if (((size_t)(input_end - input_buffer->content) >= input_buffer->length) || (*input_end != '\"'))
         {
-            goto fail;
+            goto fail;  /* 未找到结束双引号，字符串不完整 */
         }
 
+        /**
+         * 计算解码后的字符串长度：
+         * (结束位置 - 起始位置) 是原始字符串长度（包括双引号）
+         * 减去1个起始双引号，再减去转义字符数，得到解码后的长度
+         * 最后+1用于结尾的'\0'
+         */
         allocation_length = (size_t) (input_end - buffer_at_offset(input_buffer)) - skipped_bytes;
         output = (unsigned char*)input_buffer->hooks.allocate(allocation_length + sizeof(""));
         if (output == NULL)
         {
-            goto fail;
+            goto fail;  /* 内存分配失败 */
         }
     }
 
+    /**
+     * 第二阶段：实际解码
+     * 遍历原始字符串，处理转义序列，将解码后的字符写入输出缓冲区
+     */
     output_pointer = output;
     while (input_pointer < input_end)
     {
         if (*input_pointer != '\\')
         {
+            /* 普通字符直接复制 */
             *output_pointer++ = *input_pointer++;
         }
         else
         {
+            /* 处理转义序列：\x 格式 */
             unsigned char sequence_length = 2;
             if ((input_end - input_pointer) < 1)
             {
-                goto fail;
+                goto fail;  /* 转义序列不完整 */
             }
 
             switch (input_pointer[1])
             {
-                case 'b':
+                /* JSON标准转义序列 */
+                case 'b':  /* 退格 */
                     *output_pointer++ = '\b';
                     break;
-                case 'f':
+                case 'f':  /* 换页 */
                     *output_pointer++ = '\f';
                     break;
-                case 'n':
+                case 'n':  /* 换行 */
                     *output_pointer++ = '\n';
                     break;
-                case 'r':
+                case 'r':  /* 回车 */
                     *output_pointer++ = '\r';
                     break;
-                case 't':
+                case 't':  /* 制表符 */
                     *output_pointer++ = '\t';
                     break;
-                case '\"':
-                case '\\':
-                case '/':
+                case '\"':  /* 双引号 */
+                case '\\':  /* 反斜杠 */
+                case '/':   /* 正斜杠（非必须但允许转义） */
                     *output_pointer++ = input_pointer[1];
                     break;
 
-                case 'u':
+                case 'u':  /* Unicode转义：\uXXXX */
+                    /**
+                     * 处理UTF-16代理对并转换为UTF-8
+                     * 返回实际消耗的字节数（可能大于2，处理代理对时）
+                     * 返回0表示解析失败
+                     */
                     sequence_length = utf16_literal_to_utf8(input_pointer, input_end, &output_pointer);
                     if (sequence_length == 0)
                     {
-                        goto fail;
+                        goto fail;  /* 无效的Unicode转义序列 */
                     }
                     break;
 
                 default:
-                    goto fail;
+                    goto fail;  /* 非法的转义序列 */
             }
+            /* 跳过已处理的转义序列（包括反斜杠和转义字符） */
             input_pointer += sequence_length;
         }
     }
 
+    /* 添加字符串结束符 */
     *output_pointer = '\0';
 
+    /* 填充cJSON对象 */
     item->type = cJSON_String;
     item->valuestring = (char*)output;
 
+    /* 更新解析位置到结束双引号之后 */
     input_buffer->offset = (size_t) (input_end - input_buffer->content);
     input_buffer->offset++;
 
     return true;
 
 fail:
+    /* 错误处理：清理已分配的内存并回滚解析位置 */
     if (output != NULL)
     {
         input_buffer->hooks.deallocate(output);
@@ -830,6 +875,7 @@ fail:
 
     if (input_pointer != NULL)
     {
+        /* 回滚到错误发生的位置，便于上层进行错误恢复 */
         input_buffer->offset = (size_t)(input_pointer - input_buffer->content);
     }
 
