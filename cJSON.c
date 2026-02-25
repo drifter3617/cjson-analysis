@@ -618,103 +618,156 @@ static unsigned parse_hex4(const unsigned char * const input)
     return h;
 }
 
-static unsigned char utf16_literal_to_utf8(const unsigned char * const input_pointer, const unsigned char * const input_end, unsigned char **output_pointer)
+/**
+ * 将JSON中的UTF-16转义序列（\uXXXX）转换为UTF-8编码
+ * 
+ * 处理两种情况的Unicode字符：
+ * 1. 基本多文种平面（BMP）字符：单个\uXXXX（U+0000到U+FFFF）
+ * 2. 辅助平面字符：需要两个\uXXXX组成代理对（Surrogate Pair）
+ * 
+ * UTF-16代理对规则：
+ * - 高代理项（High Surrogate）：U+D800到U+DBFF
+ * - 低代理项（Low Surrogate）：U+DC00到U+DFFF
+ * - 组合公式：codepoint = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+ * 
+ * @param input_pointer 指向"\uXXXX"序列的起始位置（包括反斜杠）
+ * @param input_end 输入缓冲区的结束位置，用于边界检查
+ * @param output_pointer 输出缓冲区的指针，函数会在此位置写入UTF-8字节序列并更新指针
+ * @return 消耗的输入字节数（6表示单个\uXXXX，12表示代理对），失败返回0
+ */
+static unsigned char utf16_literal_to_utf8(const unsigned char * const input_pointer, 
+                                           const unsigned char * const input_end, 
+                                           unsigned char **output_pointer)
 {
-    long unsigned int codepoint = 0;
-    unsigned int first_code = 0;
+    long unsigned int codepoint = 0;      /* 最终的Unicode码点 */
+    unsigned int first_code = 0;           /* 第一个\uXXXX解析出的数值 */
     const unsigned char *first_sequence = input_pointer;
-    unsigned char utf8_length = 0;
-    unsigned char utf8_position = 0;
-    unsigned char sequence_length = 0;
-    unsigned char first_byte_mark = 0;
+    unsigned char utf8_length = 0;         /* UTF-8编码后的字节数 */
+    unsigned char utf8_position = 0;       
+    unsigned char sequence_length = 0;     /* 消耗的输入字节数（6或12） */
+    unsigned char first_byte_mark = 0;      /* UTF-8首字节的标记位 */
 
+    /* 至少需要6个字符：\ u X X X X */
     if ((input_end - first_sequence) < 6)
     {
         goto fail;
     }
 
+    /* 解析第一个\uXXXX为16位数值 */
     first_code = parse_hex4(first_sequence + 2);
 
+    /* 检查是否为孤立的低代理项（不能单独出现） */
     if (((first_code >= 0xDC00) && (first_code <= 0xDFFF)))
     {
         goto fail;
     }
 
+    /* 判断是否为代理对的高代理项 */
     if ((first_code >= 0xD800) && (first_code <= 0xDBFF))
     {
         const unsigned char *second_sequence = first_sequence + 6;
         unsigned int second_code = 0;
-        sequence_length = 12;
+        sequence_length = 12;  /* 代理对消耗12个字节：\uXXXX\uXXXX */
 
+        /* 检查是否有足够的空间存放第二个\uXXXX */
         if ((input_end - second_sequence) < 6)
         {
             goto fail;
         }
 
+        /* 验证第二个序列的格式必须是\uXXXX */
         if ((second_sequence[0] != '\\') || (second_sequence[1] != 'u'))
         {
             goto fail;
         }
 
+        /* 解析第二个\uXXXX */
         second_code = parse_hex4(second_sequence + 2);
+        
+        /* 验证第二个必须是有效的低代理项 */
         if ((second_code < 0xDC00) || (second_code > 0xDFFF))
         {
             goto fail;
         }
 
-
+        /**
+         * 将代理对组合成完整的Unicode码点
+         * 公式：code = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+         * 其中 first_code & 0x3FF 相当于 (first_code - 0xD800)
+         */
         codepoint = 0x10000 + (((first_code & 0x3FF) << 10) | (second_code & 0x3FF));
     }
     else
     {
+        /* 单个\uXXXX，直接使用解析出的数值 */
         sequence_length = 6;
         codepoint = first_code;
     }
 
+    /**
+     * 根据Unicode码点范围确定UTF-8编码长度和首字节标记
+     * UTF-8编码规则：
+     * U+0000 - U+007F:   0xxxxxxx (1字节)
+     * U+0080 - U+07FF:   110xxxxx 10xxxxxx (2字节)
+     * U+0800 - U+FFFF:   1110xxxx 10xxxxxx 10xxxxxx (3字节)
+     * U+10000 - U+10FFFF:11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (4字节)
+     */
     if (codepoint < 0x80)
     {
         utf8_length = 1;
+        /* first_byte_mark保持0，ASCII无需标记 */
     }
     else if (codepoint < 0x800)
     {
         utf8_length = 2;
-        first_byte_mark = 0xC0;
+        first_byte_mark = 0xC0;  /* 110xxxxx */
     }
     else if (codepoint < 0x10000)
     {
         utf8_length = 3;
-        first_byte_mark = 0xE0;
+        first_byte_mark = 0xE0;  /* 1110xxxx */
     }
-    else if (codepoint <= 0x10FFFF)
+    else if (codepoint <= 0x10FFFF)  /* Unicode最大码点 */
     {
         utf8_length = 4;
-        first_byte_mark = 0xF0;
+        first_byte_mark = 0xF0;  /* 11110xxx */
     }
     else
     {
-        goto fail;
+        goto fail;  /* 超出Unicode范围 */
     }
 
+    /**
+     * 从后向前填充UTF-8字节序列
+     * 每个后续字节都是10xxxxxx格式
+     * 最后处理首字节（包含长度标记）
+     */
     for (utf8_position = (unsigned char)(utf8_length - 1); utf8_position > 0; utf8_position--)
     {
+        /* 取低6位，加上10xxxxxx标记 */
         (*output_pointer)[utf8_position] = (unsigned char)((codepoint | 0x80) & 0xBF);
-        codepoint >>= 6;
+        codepoint >>= 6;  /* 准备处理下6位 */
     }
+    
+    /* 处理首字节 */
     if (utf8_length > 1)
     {
+        /* 组合长度标记和剩余的有效位 */
         (*output_pointer)[0] = (unsigned char)((codepoint | first_byte_mark) & 0xFF);
     }
     else
     {
+        /* ASCII字符直接使用 */
         (*output_pointer)[0] = (unsigned char)(codepoint & 0x7F);
     }
 
+    /* 更新输出指针位置 */
     *output_pointer += utf8_length;
 
     return sequence_length;
 
 fail:
-    return 0;
+    return 0;  /* 解析失败 */
 }
 
 /**
