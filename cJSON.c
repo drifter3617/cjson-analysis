@@ -18,7 +18,11 @@
 #include <limits.h>
 #include <ctype.h>
 #include <float.h>
-
+//123
+#include <ctype.h>    // 用于 isdigit
+#include <stdarg.h>   // 用于可变参数
+#include <string.h>   // 用于字符串操作
+//456
 #ifdef ENABLE_LOCALES
 #include <locale.h>
 #endif
@@ -56,6 +60,9 @@
 #define NAN 0.0/0.0
 #endif
 #endif
+//123
+
+//456
 
 typedef struct {
     const unsigned char *json;
@@ -130,6 +137,7 @@ typedef struct internal_hooks
     void *(CJSON_CDECL *reallocate)(void *pointer, size_t size);
 } internal_hooks;
 
+
 #if defined(_MSC_VER)
 static void * CJSON_CDECL internal_malloc(size_t size)
 {
@@ -152,23 +160,619 @@ static void * CJSON_CDECL internal_realloc(void *pointer, size_t size)
 #define static_strlen(string_literal) (sizeof(string_literal) - sizeof(""))
 
 static internal_hooks global_hooks = { internal_malloc, internal_free, internal_realloc };
+//123
 
+#define get_hooks() (&global_hooks)
+
+/* 指针路径结构体 */
+typedef struct pointer_path {
+    char **segments;
+    size_t count;
+    size_t capacity;
+    char *error;
+} pointer_path;
+
+/* 自定义字符串复制函数（使用hooks）*/
+static char* pointer_strdup(const char *str) {
+    if (!str) return NULL;
+    
+    internal_hooks * const hooks = get_hooks();
+    size_t len = strlen(str);
+    char *copy = (char*)hooks->allocate(len + 1);
+    if (!copy) return NULL;
+    
+    memcpy(copy, str, len + 1);
+    return copy;
+}
+
+/* 释放指针路径 */
+static void free_pointer_path(pointer_path *path) {
+    if (!path) return;
+    
+    internal_hooks * const hooks = get_hooks();
+    
+    if (path->segments) {
+        for (size_t i = 0; i < path->count; i++) {
+            if (path->segments[i]) {
+                hooks->deallocate(path->segments[i]);
+            }
+        }
+        hooks->deallocate(path->segments);
+    }
+    if (path->error) {
+        hooks->deallocate(path->error);
+    }
+    hooks->deallocate(path);
+}
+
+/* 添加段到路径 */
+static cJSON_bool add_segment_to_path(pointer_path *path, const char *segment) {
+    if (!path || !segment) return false;
+    
+    internal_hooks * const hooks = get_hooks();
+    
+    /* 检查容量 */
+    if (path->count >= path->capacity) {
+        size_t new_capacity = path->capacity == 0 ? 8 : path->capacity * 2;
+        char **new_segments = (char**)hooks->reallocate(path->segments, new_capacity * sizeof(char*));
+        if (!new_segments) return false;
+        
+        path->segments = new_segments;
+        path->capacity = new_capacity;
+    }
+    
+    /* 复制段 */
+    size_t len = strlen(segment);
+    path->segments[path->count] = (char*)hooks->allocate(len + 1);
+    if (!path->segments[path->count]) return false;
+    
+    memcpy(path->segments[path->count], segment, len + 1);
+    path->count++;
+    
+    return true;
+}
+
+/* 处理转义字符 */
+static void unescape_segment(char *segment) {
+    if (!segment) return;
+    
+    char *read = segment;
+    char *write = segment;
+    
+    while (*read) {
+        if (*read == '~') {
+            read++;
+            if (*read == '0') {
+                *write++ = '~';
+            } else if (*read == '1') {
+                *write++ = '/';
+            }
+            read++;
+        } else {
+            *write++ = *read++;
+        }
+    }
+    *write = '\0';
+}
+
+/* 检查数组索引是否有效 */
+static cJSON_bool is_valid_array_index(const char *segment) {
+    if (!segment || *segment == '\0') return false;
+    
+    /* RFC 6901 允许 '-' 表示数组末尾 */
+    if (*segment == '-') {
+        return (strlen(segment) == 1);
+    }
+    
+    /* 检查是否全为数字 */
+    for (const char *p = segment; *p; p++) {
+        if (!isdigit((unsigned char)*p)) return false;
+    }
+    
+    return true;
+}
+
+/* 解析JSON指针 */
+static pointer_path* parse_pointer(const char *pointer) {
+    internal_hooks * const hooks = get_hooks();
+    pointer_path *path = (pointer_path*)hooks->allocate(sizeof(pointer_path));
+    if (!path) return NULL;
+    
+    /* 初始化 */
+    memset(path, 0, sizeof(pointer_path));
+    
+    /* 空指针或空字符串指向根节点 */
+    if (!pointer || *pointer == '\0') {
+        return path;
+    }
+    
+    /* 必须以 '/' 开头 */
+    if (*pointer != '/') {
+        const char *err_msg = "JSON pointer must start with '/'";
+        size_t len = strlen(err_msg) + 1;
+        path->error = (char*)hooks->allocate(len);
+        if (path->error) {
+            memcpy(path->error, err_msg, len);
+        }
+        return path;
+    }
+    
+    const char *p = pointer;
+    while (*p) {
+        if (*p == '/') {
+            p++;
+            
+            const char *segment_start = p;
+            size_t segment_len = 0;
+            
+            while (*p && *p != '/') {
+                if (*p == '~') {
+                    p++;
+                    if (*p == '0' || *p == '1') {
+                        segment_len++;
+                        p++;
+                    } else {
+                        const char *err_msg = "Invalid escape sequence in pointer";
+                        size_t len = strlen(err_msg) + 1;
+                        path->error = (char*)hooks->allocate(len);
+                        if (path->error) {
+                            memcpy(path->error, err_msg, len);
+                        }
+                        return path;
+                    }
+                } else {
+                    segment_len++;
+                    p++;
+                }
+            }
+            
+            /* 提取段 */
+            char *segment = (char*)hooks->allocate(segment_len + 1);
+            if (!segment) {
+                const char *err_msg = "Memory allocation failed";
+                size_t len = strlen(err_msg) + 1;
+                path->error = (char*)hooks->allocate(len);
+                if (path->error) {
+                    memcpy(path->error, err_msg, len);
+                }
+                return path;
+            }
+            
+            memcpy(segment, segment_start, segment_len);
+            segment[segment_len] = '\0';
+            
+            /* 处理转义 */
+            unescape_segment(segment);
+            
+            /* 添加到路径 */
+            if (!add_segment_to_path(path, segment)) {
+                hooks->deallocate(segment);
+                const char *err_msg = "Failed to add segment to path";
+                size_t len = strlen(err_msg) + 1;
+                path->error = (char*)hooks->allocate(len);
+                if (path->error) {
+                    memcpy(path->error, err_msg, len);
+                }
+                return path;
+            }
+            
+            hooks->deallocate(segment);
+        } else {
+            p++;
+        }
+    }
+    
+    return path;
+}
+
+/* 通过JSON Pointer获取节点 */
+CJSON_PUBLIC(cJSON *) cJSON_GetByPointer(const cJSON * const root, const char * const pointer) {
+    if (!root) return NULL;
+    
+    /* 空指针指向根节点 */
+    if (!pointer || *pointer == '\0') {
+        return (cJSON*)root;
+    }
+    
+    pointer_path *path = parse_pointer(pointer);
+    if (!path || path->error) {
+        if (path) free_pointer_path(path);
+        return NULL;
+    }
+    
+    const cJSON *current = root;
+    
+    for (size_t i = 0; i < path->count; i++) {
+        const char *segment = path->segments[i];
+        
+        if (!current) {
+            break;
+        }
+        
+        if (cJSON_IsArray(current)) {
+            if (!is_valid_array_index(segment)) {
+                current = NULL;
+                break;
+            }
+            if (strcmp(segment, "-") == 0) {
+                /* '-' 特殊处理，返回数组本身 */
+                break;
+            }
+            int index = atoi(segment);
+            current = cJSON_GetArrayItem(current, index);
+            
+        } else if (cJSON_IsObject(current)) {
+            current = cJSON_GetObjectItem(current, segment);
+            
+        } else {
+            current = NULL;
+            break;
+        }
+    }
+    
+    free_pointer_path(path);
+    return (cJSON*)current;
+}
+
+/* 通过JSON Pointer获取节点（带错误信息） */
+CJSON_PUBLIC(cJSON *) cJSON_GetByPointerEx(const cJSON * const root, 
+                                           const char * const pointer, 
+                                           char **error) {
+    if (error) *error = NULL;
+    
+    if (!root) {
+        if (error) {
+            internal_hooks * const hooks = get_hooks();
+            const char *err_msg = "Root node is NULL";
+            size_t len = strlen(err_msg) + 1;
+            *error = (char*)hooks->allocate(len);
+            if (*error) memcpy(*error, err_msg, len);
+        }
+        return NULL;
+    }
+    
+    cJSON *result = cJSON_GetByPointer(root, pointer);
+    
+    if (!result && error) {
+        internal_hooks * const hooks = get_hooks();
+        const char *err_msg = "Path not found";
+        size_t len = strlen(err_msg) + 1;
+        *error = (char*)hooks->allocate(len);
+        if (*error) memcpy(*error, err_msg, len);
+    }
+    
+    return result;
+}
+
+/* 检查JSON指针路径是否存在 */
+CJSON_PUBLIC(cJSON_bool) cJSON_PointerExists(const cJSON * const root, 
+                                             const char * const pointer) {
+    return (cJSON_GetByPointer(root, pointer) != NULL);
+}
+
+/* 转义函数 */
+CJSON_PUBLIC(char *) cJSON_EscapePointer(const char * const segment) {
+    if (!segment) return NULL;
+    
+    internal_hooks * const hooks = get_hooks();
+    size_t len = strlen(segment);
+    size_t escaped_len = len;
+    
+    /* 计算转义后长度 */
+    for (size_t i = 0; i < len; i++) {
+        if (segment[i] == '~') escaped_len++;
+        if (segment[i] == '/') escaped_len++;
+    }
+    
+    char *escaped = (char*)hooks->allocate(escaped_len + 1);
+    if (!escaped) return NULL;
+    
+    /* 执行转义 */
+    char *out = escaped;
+    for (size_t i = 0; i < len; i++) {
+        if (segment[i] == '~') {
+            *out++ = '~';
+            *out++ = '0';
+        } else if (segment[i] == '/') {
+            *out++ = '~';
+            *out++ = '1';
+        } else {
+            *out++ = segment[i];
+        }
+    }
+    *out = '\0';
+    
+    return escaped;
+}
+
+/* 反转义函数 */
+CJSON_PUBLIC(char *) cJSON_UnescapePointer(const char * const segment) {
+    if (!segment) return NULL;
+    
+    internal_hooks * const hooks = get_hooks();
+    size_t len = strlen(segment);
+    char *unescaped = (char*)hooks->allocate(len + 1);
+    if (!unescaped) return NULL;
+    
+    char *out = unescaped;
+    for (size_t i = 0; i < len; i++) {
+        if (segment[i] == '~' && i + 1 < len) {
+            i++;
+            if (segment[i] == '0') {
+                *out++ = '~';
+            } else if (segment[i] == '1') {
+                *out++ = '/';
+            }
+        } else {
+            *out++ = segment[i];
+        }
+    }
+    *out = '\0';
+    
+    return unescaped;
+}
+
+/* 构建指针 */
+CJSON_PUBLIC(char *) cJSON_BuildPointer(size_t count, ...) {
+    internal_hooks * const hooks = get_hooks();
+    
+    if (count == 0) {
+        char *empty = (char*)hooks->allocate(1);
+        if (empty) *empty = '\0';
+        return empty;
+    }
+    
+    va_list args;
+    va_start(args, count);
+    
+    /* 计算总长度 */
+    size_t total_len = 0;
+    for (size_t i = 0; i < count; i++) {
+        const char *segment = va_arg(args, const char*);
+        if (segment) {
+            total_len += strlen(segment) + 1;
+        }
+    }
+    va_end(args);
+    
+    /* 分配内存 */
+    char *result = (char*)hooks->allocate(total_len + 1);
+    if (!result) return NULL;
+    
+    /* 构建字符串 */
+    char *out = result;
+    va_start(args, count);
+    for (size_t i = 0; i < count; i++) {
+        const char *segment = va_arg(args, const char*);
+        *out++ = '/';
+        if (segment) {
+            size_t len = strlen(segment);
+            memcpy(out, segment, len);
+            out += len;
+        }
+    }
+    va_end(args);
+    *out = '\0';
+    
+    return result;
+}
+
+/* 通过JSON Pointer添加节点 */
+CJSON_PUBLIC(cJSON_bool) cJSON_AddByPointer(cJSON * const root, 
+                                            const char * const pointer, 
+                                            cJSON * const item) {
+    if (!root || !pointer || *pointer == '\0' || !item) {
+        return false;
+    }
+    
+    pointer_path *path = parse_pointer(pointer);
+    if (!path || path->error || path->count == 0) {
+        if (path) free_pointer_path(path);
+        return false;
+    }
+    
+    cJSON *current = root;
+    
+    /* 遍历到最后一个段之前 */
+    for (size_t i = 0; i < path->count - 1; i++) {
+        const char *segment = path->segments[i];
+        
+        if (!current) {
+            free_pointer_path(path);
+            return false;
+        }
+        
+        /* 获取或创建下一级节点 */
+        cJSON *next = NULL;
+        
+        if (cJSON_IsArray(current)) {
+            if (!is_valid_array_index(segment)) {
+                free_pointer_path(path);
+                return false;
+            }
+            if (strcmp(segment, "-") == 0) {
+                int size = cJSON_GetArraySize(current);
+                next = cJSON_CreateNull();
+                cJSON_AddItemToArray(current, next);
+            } else {
+                int index = atoi(segment);
+                next = cJSON_GetArrayItem(current, index);
+                if (!next) {
+                    next = cJSON_CreateNull();
+                    while (cJSON_GetArraySize(current) <= index) {
+                        cJSON_AddItemToArray(current, cJSON_CreateNull());
+                    }
+                    cJSON_ReplaceItemInArray(current, index, next);
+                }
+            }
+        } else if (cJSON_IsObject(current)) {
+            next = cJSON_GetObjectItem(current, segment);
+            if (!next) {
+                next = cJSON_CreateObject();
+                cJSON_AddItemToObject(current, segment, next);
+            }
+        } else {
+            free_pointer_path(path);
+            return false;
+        }
+        
+        current = next;
+    }
+    
+    /* 在最后一个位置添加目标节点 */
+    const char *last_segment = path->segments[path->count - 1];
+    cJSON_bool success = false;
+    
+    if (cJSON_IsArray(current)) {
+        if (strcmp(last_segment, "-") == 0) {
+            cJSON_AddItemToArray(current, item);
+            success = true;
+        } else if (is_valid_array_index(last_segment)) {
+            int index = atoi(last_segment);
+            if (index < cJSON_GetArraySize(current)) {
+                cJSON_ReplaceItemInArray(current, index, item);
+            } else {
+                while (cJSON_GetArraySize(current) < index) {
+                    cJSON_AddItemToArray(current, cJSON_CreateNull());
+                }
+                cJSON_AddItemToArray(current, item);
+            }
+            success = true;
+        }
+    } else if (cJSON_IsObject(current)) {
+        cJSON_AddItemToObject(current, last_segment, item);
+        success = true;
+    }
+    
+    free_pointer_path(path);
+    return success;
+}
+
+/* 通过JSON Pointer删除节点 */
+CJSON_PUBLIC(cJSON_bool) cJSON_DeleteByPointer(cJSON * const root, 
+                                               const char * const pointer) {
+    if (!root || !pointer || *pointer == '\0') {
+        return false;
+    }
+    
+    /* 获取父节点和目标节点 */
+    char *parent_pointer = pointer_strdup(pointer);
+    if (!parent_pointer) return false;
+    
+    char *last_slash = strrchr(parent_pointer, '/');
+    if (!last_slash) {
+        internal_hooks * const hooks = get_hooks();
+        hooks->deallocate(parent_pointer);
+        return false;
+    }
+    
+    *last_slash = '\0';
+    const char *key = last_slash + 1;
+    
+    cJSON *parent = cJSON_GetByPointer(root, parent_pointer);
+    internal_hooks * const hooks = get_hooks();
+    hooks->deallocate(parent_pointer);
+    
+    if (!parent) return false;
+    
+    if (cJSON_IsArray(parent)) {
+        if (is_valid_array_index(key)) {
+            int index = atoi(key);
+            cJSON_DeleteItemFromArray(parent, index);
+            return true;
+        }
+    } else if (cJSON_IsObject(parent)) {
+        cJSON_DeleteItemFromObject(parent, key);
+        return true;
+    }
+    
+    return false;
+}
+
+/* 通过JSON Pointer更新节点 */
+CJSON_PUBLIC(cJSON_bool) cJSON_SetByPointer(cJSON * const root, 
+                                            const char * const pointer, 
+                                            cJSON * const new_value) {
+    if (!root || !pointer || *pointer == '\0' || !new_value) {
+        return false;
+    }
+    
+    cJSON *target = cJSON_GetByPointer(root, pointer);
+    if (!target) return false;
+    
+    internal_hooks * const hooks = get_hooks();
+    
+    /* 替换值 */
+    if (target->valuestring) {
+        hooks->deallocate(target->valuestring);
+        target->valuestring = NULL;
+    }
+    
+    /* 复制新节点的值 */
+    target->type = new_value->type;
+    
+    if (cJSON_IsString(new_value) && new_value->valuestring) {
+        target->valuestring = pointer_strdup(new_value->valuestring);
+    } else if (cJSON_IsNumber(new_value)) {
+        target->valueint = new_value->valueint;
+        target->valuedouble = new_value->valuedouble;
+    }
+    
+    return true;
+}
+//456
+/**
+ * cJSON字符串复制函数（带内存钩子）
+ * 
+ * 这是cJSON内部使用的字符串复制函数，它不同于标准的strdup：
+ * 1. 使用自定义的内存分配钩子（hooks->allocate）而不是malloc
+ * 2. 允许cJSON库在嵌入式系统或特殊内存环境中工作
+ * 3. 直接使用memcpy进行内存复制（比strcpy更高效，因为长度已知）
+ * 
+ * @param string 要复制的源字符串（可以为NULL）
+ * @param hooks 内存操作钩子结构体，包含allocate、deallocate等函数指针
+ * @return 新分配的字符串副本（需使用hooks->deallocate释放），失败返回NULL
+ */
 static unsigned char* cJSON_strdup(const unsigned char* string, const internal_hooks * const hooks)
 {
     size_t length = 0;
     unsigned char *copy = NULL;
 
+    /* 防御性编程：处理空指针输入
+     * 这符合C标准库strdup的行为规范：传入NULL返回NULL
+     * 避免了对NULL指针的解引用操作
+     */
     if (string == NULL)
     {
         return NULL;
     }
 
+    /**
+     * 计算需要分配的内存大小：
+     * strlen获取字符串长度（不含结尾的'\0'）
+     * sizeof("") == 1，用于添加字符串结束符的空间
+     * 这种写法比 +1 更直观地表达了"添加结尾空字符"的意图
+     */
     length = strlen((const char*)string) + sizeof("");
+    
+    /**
+     * 使用钩子函数分配内存
+     * 这是cJSON可移植性的关键：允许在不同环境中使用自定义内存管理
+     * 例如：在嵌入式系统中使用静态内存池，在RTOS中使用专用堆等
+     */
     copy = (unsigned char*)hooks->allocate(length);
     if (copy == NULL)
     {
+        /* 内存分配失败，遵循cJSON的错误处理模式：返回NULL */
         return NULL;
     }
+
+    /**
+     * 使用memcpy进行内存复制
+     * 为什么不用strcpy？因为我们已经知道确切的长度
+     * memcpy通常比strcpy更高效（不需要逐字节检查'\0'）
+     * 复制length字节包含了结尾的'\0'，所以复制后字符串自动终止
+     */
     memcpy(copy, string, length);
 
     return copy;
