@@ -778,33 +778,79 @@ static unsigned char* cJSON_strdup(const unsigned char* string, const internal_h
     return copy;
 }
 
+/**
+ * 初始化cJSON的内存管理钩子函数
+ * 
+ * 这是cJSON库的"内存管理总开关"，允许用户自定义内存分配/释放函数。
+ * 对于需要在特殊环境中运行cJSON的嵌入式系统、内存池管理、调试跟踪等场景至关重要。
+ * 
+ * @param hooks 包含自定义内存函数指针的结构体，为NULL时恢复默认malloc/free
+ */
 CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks)
 {
+    /* 情况1：传入NULL指针 - 恢复默认内存管理
+     * 这相当于"重置"钩子函数到标准C库的内存管理
+     * 常用于：退出特殊内存环境，或清除之前设置的自定义钩子
+     */
     if (hooks == NULL)
     {
-        global_hooks.allocate = malloc;
-        global_hooks.deallocate = free;
-        global_hooks.reallocate = realloc;
+        global_hooks.allocate = malloc;      /* 默认内存分配器 */
+        global_hooks.deallocate = free;       /* 默认内存释放器 */
+        global_hooks.reallocate = realloc;    /* 默认内存重分配器 */
         return;
     }
 
-    global_hooks.allocate = malloc;
-    if (hooks->malloc_fn != NULL)
+    /* 情况2：传入hooks指针 - 配置自定义内存管理
+     * 
+     * 设计哲学：先设置为默认值，然后根据用户提供的函数选择性覆盖
+     * 这样可以确保即使hooks结构中某些字段为NULL，也有合理的默认行为
+     */
+
+    /* 配置内存分配函数 */
+    global_hooks.allocate = malloc;           /* 先设置为默认malloc */
+    if (hooks->malloc_fn != NULL)              /* 如果用户提供了自定义分配器 */
     {
-        global_hooks.allocate = hooks->malloc_fn;
+        global_hooks.allocate = hooks->malloc_fn;  /* 使用自定义分配器 */
     }
 
-    global_hooks.deallocate = free;
-    if (hooks->free_fn != NULL)
+    /* 配置内存释放函数 */
+    global_hooks.deallocate = free;            /* 先设置为默认free */
+    if (hooks->free_fn != NULL)                 /* 如果用户提供了自定义释放器 */
     {
-        global_hooks.deallocate = hooks->free_fn;
+        global_hooks.deallocate = hooks->free_fn;  /* 使用自定义释放器 */
     }
 
-    global_hooks.reallocate = NULL;
+    /**
+     * 配置内存重分配函数 - 最复杂的部分
+     * 
+     * realloc的特殊性：
+     * 1. 不是所有内存分配器都支持realloc（如某些内存池）
+     * 2. realloc需要同时了解分配和释放的上下文
+     * 3. 自定义的allocate/free可能不兼容标准的realloc
+     * 
+     * 因此cJSON采取保守策略：只有在使用标准malloc/free时才启用realloc
+     */
+    global_hooks.reallocate = NULL;            /* 默认禁用realloc */
+    
+    /* 安全检查：只有分配器和释放器都是标准实现时，才使用标准realloc
+     * 为什么？
+     * - 如果用户自定义了allocate，但没提供realloc，使用标准realloc可能导致内存损坏
+     * - 不同内存管理实现的内存块不能混合使用（例如：用内存池分配的块不能用标准free释放）
+     */
     if ((global_hooks.allocate == malloc) && (global_hooks.deallocate == free))
     {
-        global_hooks.reallocate = realloc;
+        global_hooks.reallocate = realloc;     /* 安全启用realloc */
     }
+    
+    /**
+     * 注意：这里有个隐含的"坑"
+     * 如果用户提供了自定义的malloc_fn，但没有提供realloc_fn
+     * 那么global_hooks.reallocate将保持为NULL
+     * 这意味着任何需要realloc的操作（如cJSON数组动态增长）都将失败
+     * 
+     * 这是设计权衡：安全性优先于功能完整性
+     * 宁可功能受限，也不能冒险导致内存损坏
+     */
 }
 
 static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
