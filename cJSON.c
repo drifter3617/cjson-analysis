@@ -853,14 +853,46 @@ CJSON_PUBLIC(void) cJSON_InitHooks(cJSON_Hooks* hooks)
      */
 }
 
+/**
+ * @brief 创建一个新的cJSON节点并初始化内存
+ * 
+ * 这是cJSON内部的核心内存分配函数，负责创建所有新节点。
+ * 它使用传入的内存管理钩子（hooks）来分配内存，确保与用户设置的内存管理方式一致。
+ * 
+ * @param hooks 内存管理钩子结构体指针，包含allocate和deallocate函数
+ *              - hooks->allocate: 内存分配函数（通常是malloc的封装）
+ *              - hooks->deallocate: 内存释放函数（通常是free的封装）
+ * 
+ * @return 成功返回指向新cJSON节点的指针，失败返回NULL
+ * 
+ * @note 为什么这么设计：
+ *       1. 统一内存分配：所有节点都通过这个函数创建，便于内存管理
+ *       2. 支持自定义内存管理：通过hooks参数，允许用户提供自己的malloc/free实现
+ *       3. 自动初始化：分配后立即用0填充，避免使用未初始化的内存
+ *       4. 错误处理：如果分配失败返回NULL，由调用者处理
+ * 
+ * @example
+ * // 使用全局hooks创建新节点
+ * internal_hooks *hooks = &global_hooks;
+ * cJSON *new_item = cJSON_New_Item(hooks);
+ * if (new_item) {
+ *     new_item->type = cJSON_Object;  // 设置节点类型
+ * }
+ */
 static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
 {
+    // 使用hooks中的allocate函数分配内存（通常是malloc或用户自定义函数）
     cJSON* node = (cJSON*)hooks->allocate(sizeof(cJSON));
+    
+    // 如果内存分配成功，将分配的内存全部初始化为0
     if (node)
     {
+        // 使用memset将节点所有字节设置为'\0'
+        // 这样所有指针字段初始为NULL，数值字段初始为0
         memset(node, '\0', sizeof(cJSON));
     }
 
+    // 返回新创建的节点（可能为NULL）
     return node;
 }
 
