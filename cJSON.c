@@ -60,9 +60,7 @@
 #define NAN 0.0/0.0
 #endif
 #endif
-//123
 
-//456
 
 typedef struct {
     const unsigned char *json;
@@ -896,27 +894,47 @@ static cJSON *cJSON_New_Item(const internal_hooks * const hooks)
     return node;
 }
 
+/**
+ * @brief 递归删除cJSON节点及其所有子节点
+ * 
+ * @param item 要删除的cJSON节点指针（可为NULL）
+ * 
+ * @note 核心机制：
+ *       1. 遍历链表：通过next指针释放所有兄弟节点
+ *       2. 递归删除：child不为空时递归删除子树
+ *       3. 条件释放：根据标志位决定是否释放字符串内存
+ *       4. 安全设计：允许传入NULL，释放后内存完全回收
+ */
 CJSON_PUBLIC(void) cJSON_Delete(cJSON *item)
 {
     cJSON *next = NULL;
+    
     while (item != NULL)
     {
-        next = item->next;
+        next = item->next;  // 保存下一个节点
+        
+        // 递归删除子节点（非引用类型）
         if (!(item->type & cJSON_IsReference) && (item->child != NULL))
         {
             cJSON_Delete(item->child);
         }
+        
+        // 释放valuestring（非引用类型）
         if (!(item->type & cJSON_IsReference) && (item->valuestring != NULL))
         {
             global_hooks.deallocate(item->valuestring);
-            item->valuestring = NULL;
         }
+        
+        // 释放string（非常量字符串）
         if (!(item->type & cJSON_StringIsConst) && (item->string != NULL))
         {
             global_hooks.deallocate(item->string);
-            item->string = NULL;
         }
+        
+        // 释放节点本身
         global_hooks.deallocate(item);
+        
+        // 处理下一个兄弟节点
         item = next;
     }
 }
